@@ -1,0 +1,6 @@
+{
+  "name": "DeepSeek Workspace",
+  "description": "Sleek DeepSeek chat workspace featuring R1 Logical Thinking and automated Superagent V3 tool execution workflows including VPS terminal shell access, files control, and persistent server side storage syncing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
