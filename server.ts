@@ -450,30 +450,52 @@ app.post("/api/chat", async (req, res): Promise<any> => {
       let toolCallsToExecute: any[] = [];
 
       if (provider === "DeepSeek") {
-        const bodyPayload: any = {
-          model: activeModel,
-          messages: loopMessages,
-          temperature: activeModel === "deepseek-reasoning" ? 1.0 : 0.6,
-        };
+        let response;
+        try {
+          const bodyPayload: any = {
+            model: activeModel,
+            messages: loopMessages,
+            temperature: activeModel === "deepseek-reasoning" ? 1.0 : 0.6,
+          };
 
-        if (activeModel !== "deepseek-reasoning") {
-          bodyPayload.tools = DEEPSEEK_TOOLS;
-          bodyPayload.tool_choice = "auto";
-        }
+          if (activeModel !== "deepseek-reasoning") {
+            bodyPayload.tools = DEEPSEEK_TOOLS;
+            bodyPayload.tool_choice = "auto";
+          }
 
-        const response = await fetch("https://api.deepseek.com/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${deepseekKey}`
-          },
-          body: JSON.stringify(bodyPayload)
-        });
+          response = await fetch("https://api.deepseek.com/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${deepseekKey}`
+            },
+            body: JSON.stringify(bodyPayload)
+          });
 
-        if (!response.ok) {
-          const rawErr = await response.text();
-          console.error(`DeepSeek API server error (${response.status}):`, rawErr);
-          throw new Error(`Ошибка сервера DeepSeek API (${response.status}): ${rawErr}`);
+          if (!response.ok) {
+            const rawErr = await response.text();
+            console.error(`DeepSeek API server error (${response.status}):`, rawErr);
+            
+            // If Gemini API is available, automatically fall back to avoid downtime
+            if (hasGemini) {
+              console.warn(`DeepSeek API returned error code ${response.status}. Falling back to Gemini...`);
+              provider = "Gemini";
+              activeModel = "gemini-3.5-flash";
+              iteration--;
+              continue;
+            }
+            throw new Error(`Ошибка сервера DeepSeek API (${response.status}): ${rawErr}`);
+          }
+        } catch (fetchErr: any) {
+          console.error("DeepSeek fetch error wrapper:", fetchErr);
+          if (hasGemini) {
+            console.warn("DeepSeek offline or failed. Falling back to Gemini...");
+            provider = "Gemini";
+            activeModel = "gemini-3.5-flash";
+            iteration--;
+            continue;
+          }
+          throw fetchErr;
         }
 
         const data: any = await response.json();
