@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
-import { ChatSession, Message, LearnedLesson } from "./types";
+import { ChatSession, Message, LearnedLesson, ChatAttachment } from "./types";
 
 const LOCAL_STORAGE_KEY = "deepseek_workspace_sessions_v1";
 const ACTIVE_SESSION_KEY = "deepseek_workspace_active_id_v1";
@@ -265,8 +265,8 @@ export default function App() {
     setErrorMsg(null);
   };
 
-  // Dispatch standard text prompts
-  const handleSendMessage = async (content: string) => {
+  // Dispatch standard text prompts or voice messages
+  const handleSendMessage = async (content: string, audioUrl?: string, files?: ChatAttachment[]) => {
     if (!activeSessionId || isLoading) return;
 
     const currentSession = sessions.find((s) => s.id === activeSessionId);
@@ -278,6 +278,8 @@ export default function App() {
       role: "user",
       content: content,
       timestamp: new Date().toISOString(),
+      audioUrl: audioUrl,
+      files: files,
     };
 
     const newMessages = [...currentSession.messages, userMessage];
@@ -304,10 +306,11 @@ export default function App() {
     setErrorMsg(null);
 
     try {
-      // Map frontend logs to simple context parameter
+      // Map frontend logs to simple context parameter including files
       const contextLogs = newMessages.map((m) => ({
         role: m.role,
         content: m.content,
+        files: m.files,
       }));
 
       const res = await fetch("/api/chat", {
@@ -389,6 +392,7 @@ export default function App() {
         onToggleDeepThink={handleToggleDeepThink}
         onToggleWebSearch={handleToggleWebSearch}
         onChangeModel={handleChangeModel}
+        geminiApiKey={geminiApiKey}
       />
     </div>
   );

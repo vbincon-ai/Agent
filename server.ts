@@ -232,10 +232,139 @@ const DEEPSEEK_TOOLS = [
         "required": ["category", "title", "details"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "document_rag_search",
+      "description": "Умное индексирование и локальный семантический RAG поиск по большим текстовым файлам/документам (спецификации, логи, базы кодов) без переполнения контекста модели.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Путь к индексируемому файлу на сервере"
+          },
+          "query": {
+            "type": "string",
+            "description": "Поисковый запрос с ключевыми словами или фразой для семантического ранжирования фрагментов"
+          }
+        },
+        "required": ["path", "query"]
+      }
+    }
   }
 ];
 
 // Tool Implementation Logic
+async function document_rag_search_tool(filePath: string, query: string): Promise<string> {
+  try {
+    const target = path.isAbsolute(filePath) ? filePath : path.resolve(process.cwd(), filePath);
+    const text = await fs.readFile(target, "utf-8");
+    
+    if (!text || text.trim() === "") {
+      return `Документ ${filePath} пуст.`;
+    }
+
+    if (text.length <= 6000) {
+      return `[Документ малого объема. Возвращен весь текст для прямого анализа]:\n\n--- СОДЕРЖИМОЕ ФАЙЛА ${filePath} ---\n${text}`;
+    }
+
+    // Smart Chunking Layout: split into blocks of ~1000 chars with overlapping (~200 chars)
+    const chunkSize = 1000;
+    const overlap = 200;
+    const chunks: { index: number; content: string; startLine: number; endLine: number }[] = [];
+    
+    const lines = text.split("\n");
+    let currentLineIndex = 1;
+
+    for (let i = 0; i < text.length; ) {
+      const end = Math.min(i + chunkSize, text.length);
+      const chunkText = text.substring(i, end);
+      
+      const chunkLinesCount = chunkText.split("\n").length - 1;
+      const startLine = currentLineIndex;
+      const endLine = currentLineIndex + chunkLinesCount;
+
+      chunks.push({
+        index: chunks.length + 1,
+        content: chunkText,
+        startLine,
+        endLine
+      });
+
+      const step = chunkSize - overlap;
+      const stepText = text.substring(i, Math.min(i + step, text.length));
+      const stepLinesCount = stepText.split("\n").length - 1;
+      currentLineIndex += stepLinesCount;
+      
+      i += step;
+      if (i >= text.length - overlap) break;
+    }
+
+    // Tokenize query
+    const queryTokens = query
+      .toLowerCase()
+      .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?"']/g, " ")
+      .split(/\s+/)
+      .filter(t => t.length > 1 && !["и", "в", "на", "как", "не", "что", "чтобы", "это", "этот", "для", "по", "из", "с", "а", "но", "или", "the", "a", "of", "to", "and", "in", "is"].includes(t));
+
+    if (queryTokens.length === 0) {
+      queryTokens.push(...query.toLowerCase().split(/\s+/).filter(t => t.length > 0));
+    }
+
+    // Rank chunks
+    const scoredChunks = chunks.map(chunk => {
+      let score = 0;
+      const contentLower = chunk.content.toLowerCase();
+      
+      const sanitizedQuery = query.toLowerCase().trim();
+      if (contentLower.includes(sanitizedQuery)) {
+        score += 150;
+      }
+
+      for (const token of queryTokens) {
+        if (token.length < 2) continue;
+        let count = 0;
+        let pos = contentLower.indexOf(token);
+        while (pos !== -1) {
+          count++;
+          pos = contentLower.indexOf(token, pos + token.length);
+        }
+        if (count > 0) {
+          score += (count * 10) + (token.length * 4);
+        }
+      }
+
+      return { chunk, score };
+    });
+
+    scoredChunks.sort((a, b) => b.score - a.score);
+
+    const topMatches = scoredChunks.filter(m => m.score > 0).slice(0, 4);
+    const finalMatches = topMatches.length > 0 ? topMatches : scoredChunks.slice(0, 3);
+    
+    let result = `=== РЕЗУЛЬТАТЫ СЕМАНТИЧЕСКОГО СЛУЖЕБНОГО ПОИСКА RAG: "${query}" ===\n`;
+    result += `Файл: ${filePath}\n`;
+    result += `Всего проиндексировано сегментов: ${chunks.length}\n\n`;
+
+    finalMatches.forEach((m, idx) => {
+      result += `[ФРАГМЕНТ #${idx + 1} (Релевантность: ${m.score} баллов, Строки: ${m.chunk.startLine}-${m.chunk.endLine})]\n`;
+      result += `--------------------------------------------------------\n`;
+      result += m.chunk.content.trim() + `\n`;
+      result += `--------------------------------------------------------\n\n`;
+    });
+
+    if (finalMatches.length === 0 || finalMatches[0].score === 0) {
+      result += `[Предупреждение]: Точные совпадения по ключевым словам не обнаружены. Рекомендуется повторить поиск с более общими терминами, либо прочитать файл целиком с помощью 'read_file'.\n`;
+    }
+
+    return result;
+  } catch (err: any) {
+    return `Ошибка индексирования или семантического поиска RAG по файлу ${filePath}: ${err.message}`;
+  }
+}
+
 async function read_file_tool(filePath: string): Promise<string> {
   try {
     const target = path.isAbsolute(filePath) ? filePath : path.resolve(process.cwd(), filePath);
@@ -362,54 +491,240 @@ app.post("/api/chat", async (req, res): Promise<any> => {
 
     const deepseekKey = req.body.deepseekApiKey || req.headers["x-deepseek-key"] || process.env.DEEPSEEK_API_KEY;
     const geminiKey = req.body.geminiApiKey || req.headers["x-gemini-key"] || process.env.GEMINI_API_KEY;
+    const routerKey = req.body.routerApiKey || req.headers["x-router-key"] || process.env.ROUTER_API_KEY;
 
     const hasDeepSeek = deepseekKey && deepseekKey.trim() !== "" && !deepseekKey.includes("MY_DEEPSEEK_API_KEY");
     const hasGemini = geminiKey && geminiKey.trim() !== "" && !geminiKey.includes("MY_GEMINI_API_KEY");
+    const hasRouter = routerKey && routerKey.trim() !== "" && !routerKey.includes("MY_ROUTER_API_KEY");
 
-    let provider: "DeepSeek" | "Gemini" = "DeepSeek";
-    let activeModel = "";
-    const isReasoning = !!deepThink;
-
-    const modelSelection = requestedModel || "auto";
-
-    if (modelSelection === "auto") {
-      if (hasDeepSeek) {
-        provider = "DeepSeek";
-        activeModel = isReasoning ? "deepseek-reasoning" : "deepseek-chat";
-      } else if (hasGemini) {
-        provider = "Gemini";
-        activeModel = "gemini-3.5-flash";
-      } else {
-        return res.status(400).json({
-          error: "Ни один из ключей API (DEEPSEEK_API_KEY или GEMINI_API_KEY) не настроен. Пожалуйста, укажите хотя бы один из них в Secrets/Свойствах."
-        });
-      }
-    } else if (modelSelection === "gemini-3.5-flash") {
-      provider = "Gemini";
-      activeModel = "gemini-3.5-flash";
-      if (!hasGemini) {
-        return res.status(400).json({
-          error: "Выбранная модель Gemini недоступна, так как GEMINI_API_KEY не задан."
-        });
-      }
-    } else {
-      provider = "DeepSeek";
-      activeModel = modelSelection === "deepseek-reasoning" ? "deepseek-reasoning" : "deepseek-chat";
-      if (!hasDeepSeek) {
-        return res.status(400).json({
-          error: "Выбранная модель DeepSeek недоступна, так как DEEPSEEK_API_KEY не задан."
-        });
+    // --- SMART MEMORY LAYER / HISTORY OPTIMIZATION & COMPRESSION ---
+    let totalChars = 0;
+    for (const msg of messages) {
+      if (msg && typeof msg.content === "string") {
+        totalChars += msg.content.length;
       }
     }
 
-    console.log(`Processing message. Provider: ${provider}, Model: ${activeModel}, Reasoning: ${isReasoning}`);
+    console.log(`[Memory Indexer] Active context size: ${totalChars} chars over ${messages.length} messages.`);
 
-    let loopMessages = messages.map((m: any) => ({
+    // If context size triggers optimization threshold, compress intermediate history layers
+    if (totalChars > 25000 || messages.length > 14) {
+      console.log("[Memory Indexer] Context limit warning. Executing automatic middle-history summarization...");
+      try {
+        const systemMessage = messages.find((m: any) => m.role === "system");
+        const startIndex = systemMessage ? 1 : 0;
+        
+        // Keep system parameters, the very first 2 messages, and the last 6 messages intact
+        const middleStartIndex = startIndex + 2;
+        const tailStartIndex = messages.length - 6;
+
+        if (tailStartIndex > middleStartIndex) {
+          const headerMessages = messages.slice(0, middleStartIndex);
+          const middleMessages = messages.slice(middleStartIndex, tailStartIndex);
+          const tailMessages = messages.slice(tailStartIndex);
+
+          console.log(`[Memory Indexer] Compressing ${middleMessages.length} intermediate messages into a semantic summary...`);
+
+          const summarizationPrompt = `История предыдущего диалога для сжатия:\n` + 
+            middleMessages.map((m: any) => `${m.role === "user" ? "Пользователь" : m.role === "assistant" ? "Ассистент" : "Инструмент"}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`).join("\n---\n") + 
+            `\n\nСделай краткое научно-техническое саммари (сжатый отчет) этой переписки на русском языке. Укажи: какие файлы были созданы, какие команды запущены, текущий статус проекта, и основные договоренности. Верни ТОЛЬКО сжатую суть без лишнего шума. Формат: "[Сжатый архив истории диалога: ...]"`;
+
+          let summary = "";
+
+          // Attempt using RouterAI model for quick translation/summary
+          if (hasRouter) {
+            try {
+              const sumResponse = await fetch("https://routerai.ru/api/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${routerKey}`
+                },
+                body: JSON.stringify({
+                  model: "google/gemini-2.0-flash",
+                  messages: [{ role: "user", content: summarizationPrompt }],
+                  temperature: 0.3
+                })
+              });
+              if (sumResponse.ok) {
+                const sumData: any = await sumResponse.json();
+                summary = sumData?.choices?.[0]?.message?.content || "";
+              }
+            } catch (e) {
+              console.error("[Memory Indexer] RouterAI summarization failed:", e);
+            }
+          }
+
+          // Fallback to direct Gemini Flash if RouterAI failed or is configured out
+          if (!summary && hasGemini) {
+            try {
+              const ai = getGeminiClient(geminiKey);
+              const sumResp = await ai.models.generateContent({
+                model: "gemini-3.5-flash",
+                contents: summarizationPrompt,
+                config: { temperature: 0.3 }
+              });
+              summary = sumResp.text || "";
+            } catch (e) {
+              console.error("[Memory Indexer] Gemini summarization failed:", e);
+            }
+          }
+
+          if (summary && summary.trim() !== "") {
+            console.log("[Memory Indexer] Middle context summarized successfully.");
+            const compressedMessages = [
+              ...headerMessages,
+              {
+                role: "system",
+                content: `[СИСТЕМНЫЙ АРХИВ ПАМЯТИ: Средняя часть диалога была сжата для уменьшения потребления токенов. Сводка архивного контекста:\n${summary}\nУчти эти факты и продолженный прогресс в своей дальнейшей работе!]`
+              },
+              ...tailMessages
+            ];
+            req.body.messages = compressedMessages;
+          } else {
+            console.warn("[Memory Indexer] Summarization APIs offline or silent. Utilizing safe sliding window context pruning...");
+            const compressedMessages = [
+              ...headerMessages,
+              {
+                role: "system",
+                content: `[АРХИВ ПАМЯТИ: Средняя часть переписки (сообщений: ${middleMessages.length}) скрыта для предотвращения переполнения контекста.]`
+              },
+              ...tailMessages
+            ];
+            req.body.messages = compressedMessages;
+          }
+        }
+      } catch (optErr) {
+        console.error("[Memory Indexer] Failed optimizing dialogue context:", optErr);
+      }
+    }
+
+    const activeMessages = req.body.messages || messages;
+
+    // --- COGNITIVE SEMANTIC ROUTING LAYER ---
+    let provider: "DeepSeek" | "Gemini" | "RouterAI" = "DeepSeek";
+    let activeModel = "";
+    const isReasoning = !!deepThink;
+    const modelSelection = requestedModel || "auto";
+
+    // Extract last user message to assess model preferences
+    const lastUserMessage = activeMessages.slice().reverse().find((m: any) => m.role === "user")?.content || "";
+    let userRequestedModelPrefix = "";
+    let userRequestedModelLabel = "";
+    const lowerMsg = lastUserMessage.toLowerCase();
+
+    if (lowerMsg.includes("дипсик") || lowerMsg.includes("deepseek") || lowerMsg.includes("ds")) {
+      userRequestedModelPrefix = "deepseek";
+      userRequestedModelLabel = "DeepSeek Cheap/Chat";
+    } else if (lowerMsg.includes("gpt") || lowerMsg.includes("дпт") || lowerMsg.includes("openai") || lowerMsg.includes("гпт")) {
+      userRequestedModelPrefix = "openai";
+      userRequestedModelLabel = "GPT-4o";
+    } else if (lowerMsg.includes("gemini") || lowerMsg.includes("гемини") || lowerMsg.includes("джемини") || lowerMsg.includes("флеш")) {
+      userRequestedModelPrefix = "gemini";
+      userRequestedModelLabel = "Gemini Flash";
+    } else if (lowerMsg.includes("claude") || lowerMsg.includes("клод") || lowerMsg.includes("антропик")) {
+      userRequestedModelPrefix = "claude";
+      userRequestedModelLabel = "Claude 3.5 Sonnet";
+    }
+
+    // Identify task complexity level
+    let containsComplexTask = false;
+    let complexityReason = "";
+
+    if (
+      lowerMsg.includes("напиши") || 
+      lowerMsg.includes("код") || 
+      lowerMsg.includes("скрипт") || 
+      lowerMsg.includes("исправь") || 
+      lowerMsg.includes("ошибк") || 
+      lowerMsg.includes("баг") || 
+      lowerMsg.includes("vps") || 
+      lowerMsg.includes("терминал") || 
+      lowerMsg.includes("команд") || 
+      lowerMsg.includes("создай") || 
+      lowerMsg.includes("файл") ||
+      lowerMsg.includes("выполни") ||
+      lowerMsg.includes("запусти") ||
+      lowerMsg.includes("сложн") ||
+      isReasoning
+    ) {
+      containsComplexTask = true;
+      complexityReason = "содержит написание или отладку кода, команды системного уровня VPS или глубокое рассуждение";
+    }
+
+    let routingSystemInstructionOverride = "";
+
+    if (hasRouter && modelSelection === "auto") {
+      provider = "RouterAI";
+      
+      if (containsComplexTask) {
+        // High complexity -> route to flagships: DeepSeek Reasoning or GPT-4o
+        activeModel = userRequestedModelPrefix === "openai" ? "openai/gpt-4o" : "deepseek/deepseek-reasoning";
+        
+        if (userRequestedModelPrefix === "deepseek" && !lowerMsg.includes("reasoning") && !lowerMsg.includes("рассужд")) {
+          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Пользователь просил использовать стандартный дешевый DeepSeek, но задача крайне сложная (${complexityReason}). Поэтому роутер под капотом перенаправил запрос на мощную модель "deepseek/deepseek-reasoning" с глубоким мышлением. Обязательно в НАЧАЛЕ своего ответа прокомментируй это дружелюбно и непринужденно в стиле: "Чувак, нифига, задача сложная (связана с кодом/инфраструктурой), поэтому я задействовал глубокое рассуждение DeepSeek Reasoning, а не простой чат!". Пожалуйста, скажи это ровно в таком дружеском тоне.`;
+        } else if (userRequestedModelPrefix && userRequestedModelPrefix !== "deepseek") {
+          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Пользователь выбрал ${userRequestedModelLabel}, но задача сложная (${complexityReason}). Сервер автоматически перенаправил запрос на модель ${activeModel} для высочайшего качества. Прокомментируй это дружелюбно в начале ответа: "Чувак, задача довольно сложная, поэтому чтобы всё прошло идеально, я подключил мощную модель ${activeModel === "openai/gpt-4o" ? "GPT-4o" : "DeepSeek Reasoning"}!".`;
+        } else {
+          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Задача классифицирована как высокосложная (${complexityReason}). Сервер под капотом выбрал флагманскую модель "${activeModel}" для лучшего результата. Кратко обоснуй это решение пользователю в начале ответа в живом дружеском ключе.`;
+        }
+      } else {
+        // Low complexity -> fast, lighter model
+        activeModel = userRequestedModelPrefix === "openai" ? "openai/gpt-4o-mini" : 
+                      (userRequestedModelPrefix === "deepseek" ? "deepseek/deepseek-chat" : "google/gemini-2.0-flash");
+                     
+        if (userRequestedModelPrefix) {
+          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Подтверждена простая задача. Сервер послушно задействовал выбранный тобой "${activeModel}". Сделай забавное замечание в начале ответа, например: "Класс, задача простая, поэтому с удовольствием юзаю ${userRequestedModelLabel}!"`;
+        } else {
+          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Обычный легкий запрос. Сервер автоматически задействовал быструю модель "${activeModel}".`;
+        }
+      }
+    } else {
+      // Direct traditional provider configurations
+      if (modelSelection === "auto") {
+        if (hasDeepSeek) {
+          provider = "DeepSeek";
+          activeModel = isReasoning ? "deepseek-reasoning" : "deepseek-chat";
+          
+          if (userRequestedModelPrefix === "gemini") {
+            routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Ты запущен на ${activeModel}. Пользователь просил Gemini, но ты используешь DeepSeek. Подшути в начале ответа: "Чувак, нифига, давай лучше на DeepSeek, тут задача поинтереснее будет!"`;
+          }
+        } else if (hasGemini) {
+          provider = "Gemini";
+          activeModel = "gemini-3.5-flash";
+          
+          if (userRequestedModelPrefix === "deepseek") {
+            routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Ты запущен на Gemini. Пользователь просил DeepSeek, но его ключ не задан. Прокомментируй это дружелюбно: "Чувак, я бы с радостью взял Дипсик, но его API-ключ не настроен, поэтому летим на Gemini!"`;
+          }
+        } else {
+          return res.status(400).json({
+            error: "Ни один из ключей API (ROUTER_API_KEY, DEEPSEEK_API_KEY или GEMINI_API_KEY) не настроен. Пожалуйста, настройте хотя бы один в Secrets."
+          });
+        }
+      } else if (modelSelection === "gemini-3.5-flash") {
+        provider = "Gemini";
+        activeModel = "gemini-3.5-flash";
+        if (!hasGemini) {
+          return res.status(400).json({ error: "Выбранная модель Gemini недоступна, так как GEMINI_API_KEY не задан." });
+        }
+      } else {
+        provider = "DeepSeek";
+        activeModel = modelSelection === "deepseek-reasoning" ? "deepseek-reasoning" : "deepseek-chat";
+        if (!hasDeepSeek) {
+          return res.status(400).json({ error: "Выбранная модель DeepSeek недоступна, так как DEEPSEEK_API_KEY не задан." });
+        }
+      }
+    }
+
+    console.log(`[Cognitive Routing] Provider: ${provider}, Model: ${activeModel}, Reasoning: ${isReasoning}`);
+
+    let loopMessages = activeMessages.map((m: any) => ({
       role: m.role,
       content: m.content,
       tool_calls: m.tool_calls,
       name: m.name,
       tool_call_id: m.tool_call_id,
+      files: m.files,
     })) as any[];
 
     // Inject Superagent core prompt
@@ -425,12 +740,20 @@ app.post("/api/chat", async (req, res): Promise<any> => {
         ? "Ты — высокоточный искусственный интеллект Ин-Кон. Отвечай детально, логично и веди глубокие рассуждения."
         : `Ты — высокотехнологичный Суперагент Ин-Кон. У тебя есть встроенные инструменты автоматизации VPS сервера (чтение и запись файлов, выполнение shell-команд, веб-поиск, импорт сайтов и запись уроков). Используй их активно при первой необходимости для решения задач пользователя. Отвечай на русском языке. Если ты изучил новые факты об инфраструктуре, сервере VPS или предпочтениях пользователя, выменяй и сохрани этот урок через 'memorize_lesson'.${lessonsBlock}`;
 
+      if (routingSystemInstructionOverride) {
+        systemText += routingSystemInstructionOverride;
+      }
+
       loopMessages.unshift({
         role: "system",
         content: systemText
       });
     } else {
-      systemText = loopMessages.find(m => m.role === "system")?.content || "";
+      const sysMsg = loopMessages.find(m => m.role === "system");
+      if (sysMsg && routingSystemInstructionOverride) {
+        sysMsg.content = (sysMsg.content || "") + routingSystemInstructionOverride;
+      }
+      systemText = sysMsg?.content || "";
     }
 
     let finalContent = "";
@@ -449,12 +772,97 @@ app.post("/api/chat", async (req, res): Promise<any> => {
       let hasToolCalls = false;
       let toolCallsToExecute: any[] = [];
 
-      if (provider === "DeepSeek") {
+      if (provider === "RouterAI") {
         let response;
         try {
           const bodyPayload: any = {
             model: activeModel,
-            messages: loopMessages,
+            messages: loopMessages.map((m: any) => {
+              let textContent = m.content || "";
+              if (m.files && Array.isArray(m.files) && m.files.length > 0) {
+                const fileNames = m.files.map((f: any) => `[Вложенный файл: ${f.name} (тип: ${f.type})]`).join("\n");
+                textContent = `${textContent}\n\n${fileNames}`;
+              }
+              return {
+                role: m.role,
+                content: textContent,
+                tool_calls: m.tool_calls,
+                name: m.name,
+                tool_call_id: m.tool_call_id,
+              };
+            }),
+            temperature: activeModel.includes("reasoning") ? 1.0 : 0.6,
+          };
+
+          // Enable tool-calling loop for normal chat models inside RouterAI
+          if (!activeModel.includes("reasoning")) {
+            bodyPayload.tools = DEEPSEEK_TOOLS;
+            bodyPayload.tool_choice = "auto";
+          }
+
+          response = await fetch("https://routerai.ru/api/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${routerKey}`
+            },
+            body: JSON.stringify(bodyPayload)
+          });
+
+          if (!response.ok) {
+            const rawErr = await response.text();
+            console.error(`RouterAI API server error (${response.status}):`, rawErr);
+            throw new Error(`Ошибка сервера RouterAI API (${response.status}): ${rawErr}`);
+          }
+        } catch (fetchErr: any) {
+          console.error("RouterAI fetch error wrapper:", fetchErr);
+          if (hasGemini) {
+            console.warn("RouterAI failed to complete request. Falling back to Gemini...");
+            provider = "Gemini";
+            activeModel = "gemini-3.5-flash";
+            iteration--;
+            continue;
+          }
+          throw fetchErr;
+        }
+
+        const data: any = await response.json();
+        totalDuration += Math.round((Date.now() - startTime) / 1000);
+
+        const choice = data?.choices?.[0]?.message;
+        finalContent = choice?.content || "";
+        if (choice?.reasoning_content) {
+          reasoningContent = choice.reasoning_content;
+        }
+
+        hasToolCalls = choice?.tool_calls && choice.tool_calls.length > 0;
+        if (hasToolCalls) {
+          toolCallsToExecute = choice.tool_calls;
+          loopMessages.push({
+            role: "assistant",
+            content: choice.content || null,
+            tool_calls: choice.tool_calls
+          } as any);
+        }
+      } else if (provider === "DeepSeek") {
+        let response;
+        try {
+          const bodyPayload: any = {
+            model: activeModel,
+            messages: loopMessages.map((m: any) => {
+              let textContent = m.content || "";
+              if (m.files && Array.isArray(m.files) && m.files.length > 0) {
+                const fileNames = m.files.map((f: any) => `[Вложенный файл: ${f.name} (тип: ${f.type})]`).join("\n");
+                textContent = `${textContent}\n\n${fileNames}`;
+              }
+              return {
+                role: m.role,
+                content: textContent,
+                tool_calls: m.tool_calls,
+                name: m.name,
+                tool_call_id: m.tool_call_id,
+              };
+            }),
             temperature: activeModel === "deepseek-reasoning" ? 1.0 : 0.6,
           };
 
@@ -476,8 +884,8 @@ app.post("/api/chat", async (req, res): Promise<any> => {
             const rawErr = await response.text();
             console.error(`DeepSeek API server error (${response.status}):`, rawErr);
             
-            // If Gemini API is available, automatically fall back to avoid downtime
-            if (hasGemini) {
+            // If Gemini API is available, automatically fall back to avoid downtime (only if selection was 'auto')
+            if (hasGemini && modelSelection === "auto") {
               console.warn(`DeepSeek API returned error code ${response.status}. Falling back to Gemini...`);
               provider = "Gemini";
               activeModel = "gemini-3.5-flash";
@@ -488,7 +896,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
           }
         } catch (fetchErr: any) {
           console.error("DeepSeek fetch error wrapper:", fetchErr);
-          if (hasGemini) {
+          if (hasGemini && modelSelection === "auto") {
             console.warn("DeepSeek offline or failed. Falling back to Gemini...");
             provider = "Gemini";
             activeModel = "gemini-3.5-flash";
@@ -540,9 +948,33 @@ app.post("/api/chat", async (req, res): Promise<any> => {
         for (const msg of loopMessages) {
           if (msg.role === "system") continue;
           
+          if (msg.parts && Array.isArray(msg.parts)) {
+            geminiContents.push({
+              role: msg.role === "assistant" ? "model" : "user",
+              parts: msg.parts
+            });
+            continue;
+          }
+          
           const parts: any[] = [];
           if (msg.content) {
             parts.push({ text: msg.content });
+          }
+          
+          if (msg.files && Array.isArray(msg.files)) {
+            for (const file of msg.files) {
+              const match = file.base64.match(/^data:([^;]+);base64,(.+)$/);
+              if (match) {
+                const mimeType = match[1];
+                const base64Data = match[2];
+                parts.push({
+                  inlineData: {
+                    mimeType: mimeType,
+                    data: base64Data
+                  }
+                });
+              }
+            }
           }
           
           if (msg.tool_calls) {
@@ -610,6 +1042,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
           loopMessages.push({
             role: "assistant",
             content: finalContent || null,
+            parts: response.candidates?.[0]?.content?.parts || [],
             tool_calls: mappedCalls
           } as any);
         }
@@ -648,6 +1081,8 @@ app.post("/api/chat", async (req, res): Promise<any> => {
             output = await web_search_tool(args.query);
           } else if (toolName === "scrape_url") {
             output = await scrape_url_tool(args.url);
+          } else if (toolName === "document_rag_search") {
+            output = await document_rag_search_tool(args.path, args.query);
           } else if (toolName === "memorize_lesson") {
             const newItem = await add_lesson_record(args.category, args.title, args.details);
             output = `Новый урок "${newItem.title}" успешно сохранен в базу знаний самообучения VPS. Номер записи: ${newItem.id}`;
@@ -691,6 +1126,59 @@ app.post("/api/chat", async (req, res): Promise<any> => {
     console.error("Superagent Controller Error:", error);
     res.status(500).json({
       error: error.message || "Ошибка при выполнении запроса суперагента.",
+    });
+  }
+});
+
+/**
+ * Voice Transcription Endpoint utilizing server-side Gemini 3.5 Flash
+ */
+app.post("/api/transcribe", async (req, res): Promise<any> => {
+  try {
+    const { audio, mimeType, geminiApiKey } = req.body;
+    if (!audio) {
+      return res.status(400).json({ error: "Предоставьте звуковые данные (base64) для транскрибирования." });
+    }
+
+    const key = geminiApiKey || req.headers["x-gemini-key"] || process.env.GEMINI_API_KEY;
+    if (!key || key.trim() === "" || key.includes("MY_GEMINI_API_KEY")) {
+      return res.status(400).json({
+        error: "Для распознавания голосовых сообщений требуется настроенный GEMINI_API_KEY в Secrets/Свойствах проекта."
+      });
+    }
+
+    console.log(`[Voice] Starting transcription... mimeType: ${mimeType || "audio/webm"}`);
+    
+    // Remove potential dataURL prefix
+    let cleanBase64 = audio;
+    if (audio.includes(";base64,")) {
+      cleanBase64 = audio.split(";base64,")[1];
+    }
+
+    const ai = getGeminiClient(key);
+    
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: [
+        {
+          inlineData: {
+            data: cleanBase64,
+            mimeType: mimeType || "audio/webm"
+          }
+        },
+        {
+          text: "Транскрибируй это аудиосообщение на русском языке. Напиши только услышанный текст, без каких-либо комментариев, знаков препинания или собственных исправлений."
+        }
+      ]
+    });
+
+    const transcribedText = response.text || "";
+    console.log(`[Voice] Transcribed Text: "${transcribedText.trim()}"`);
+    return res.json({ text: transcribedText.trim() });
+  } catch (err: any) {
+    console.error("Transcription Controller Error:", err);
+    return res.status(500).json({
+      error: err.message || "Не удалось расшифровать голосовую запись."
     });
   }
 });
