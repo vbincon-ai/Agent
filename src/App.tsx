@@ -15,6 +15,7 @@ export default function App() {
   const [lessons, setLessons] = useState<LearnedLesson[]>([]);
   const [deepseekApiKey, setDeepseekApiKey] = useState(() => localStorage.getItem("deepseek_apiKey") || "");
   const [geminiApiKey, setGeminiApiKey] = useState(() => localStorage.getItem("gemini_apiKey") || "");
+  const [routerApiKey, setRouterApiKey] = useState(() => localStorage.getItem("router_apiKey") || "");
 
   const handleDeepseekApiKeyChange = (key: string) => {
     setDeepseekApiKey(key);
@@ -24,6 +25,11 @@ export default function App() {
   const handleGeminiApiKeyChange = (key: string) => {
     setGeminiApiKey(key);
     localStorage.setItem("gemini_apiKey", key);
+  };
+
+  const handleRouterApiKeyChange = (key: string) => {
+    setRouterApiKey(key);
+    localStorage.setItem("router_apiKey", key);
   };
 
   // Keyboard shortcut listeners (Ctrl+I for new chat)
@@ -323,6 +329,7 @@ export default function App() {
           model: currentSession.model || "auto",
           deepseekApiKey,
           geminiApiKey,
+          routerApiKey,
         }),
       });
 
@@ -380,6 +387,8 @@ export default function App() {
         onDeepseekApiKeyChange={handleDeepseekApiKeyChange}
         geminiApiKey={geminiApiKey}
         onGeminiApiKeyChange={handleGeminiApiKeyChange}
+        routerApiKey={routerApiKey}
+        onRouterApiKeyChange={handleRouterApiKeyChange}
       />
 
       <ChatWindow

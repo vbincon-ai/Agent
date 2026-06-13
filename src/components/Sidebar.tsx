@@ -16,6 +16,8 @@ interface SidebarProps {
   onDeepseekApiKeyChange: (key: string) => void;
   geminiApiKey: string;
   onGeminiApiKeyChange: (key: string) => void;
+  routerApiKey: string;
+  onRouterApiKeyChange: (key: string) => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -32,10 +34,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onDeepseekApiKeyChange,
   geminiApiKey,
   onGeminiApiKeyChange,
+  routerApiKey,
+  onRouterApiKeyChange,
 }) => {
   const [showKeys, setShowKeys] = React.useState(false);
   const [visibleDeepSeek, setVisibleDeepSeek] = React.useState(false);
   const [visibleGemini, setVisibleGemini] = React.useState(false);
+  const [visibleRouter, setVisibleRouter] = React.useState(false);
 
   return (
     <>
@@ -241,6 +246,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       className="absolute inset-y-0 right-0 pr-2 flex items-center text-zinc-400 hover:text-zinc-650 cursor-pointer"
                     >
                       {visibleGemini ? <EyeOff size={11} /> : <Eye size={11} />}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Router AI API Key */}
+                <div className="space-y-1">
+                  <label className="block text-[9px] font-bold text-zinc-400 uppercase tracking-wider">ROUTER AI API KEY</label>
+                  <div className="relative">
+                    <input
+                      type={visibleRouter ? "text" : "password"}
+                      value={routerApiKey}
+                      onChange={(e) => onRouterApiKeyChange(e.target.value)}
+                      placeholder="RouterAI:..."
+                      className="w-full text-[11px] font-mono pr-7 pl-2 py-1.5 bg-zinc-50 hover:bg-zinc-100/30 border border-zinc-200 focus:border-[#1b5df7] rounded-md focus:outline-hidden transition-all text-zinc-800"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setVisibleRouter(!visibleRouter)}
+                      className="absolute inset-y-0 right-0 pr-2 flex items-center text-zinc-400 hover:text-zinc-650 cursor-pointer"
+                    >
+                      {visibleRouter ? <EyeOff size={11} /> : <Eye size={11} />}
                     </button>
                   </div>
                 </div>

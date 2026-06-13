@@ -48,11 +48,14 @@ app.use(express.urlencoded({ limit: "15mb", extended: true }));
 // Ensure directories exist
 const CONVERSATIONS_DIR = path.join(process.cwd(), "data", "conversations");
 const LESSONS_FILE = path.join(process.cwd(), "data", "lessons.json");
+const CUSTOM_TOOLS_DIR = path.join(process.cwd(), "data", "custom_tools");
+const CUSTOM_TOOLS_MANIFEST = path.join(CUSTOM_TOOLS_DIR, "manifest.json");
 
 const initDirectories = async () => {
   try {
     await fs.mkdir(CONVERSATIONS_DIR, { recursive: true });
-    console.log(`Directories normalized: ${CONVERSATIONS_DIR}`);
+    await fs.mkdir(CUSTOM_TOOLS_DIR, { recursive: true });
+    console.log(`Directories normalized: ${CONVERSATIONS_DIR} and ${CUSTOM_TOOLS_DIR}`);
     
     // Seed default lessons if missing
     try {
@@ -77,6 +80,14 @@ const initDirectories = async () => {
       await fs.writeFile(LESSONS_FILE, JSON.stringify(defaultLessons, null, 2), "utf-8");
       console.log("Memory database seeded with initial lessons.");
     }
+
+    // Seed default custom tools manifest if missing
+    try {
+      await fs.access(CUSTOM_TOOLS_MANIFEST);
+    } catch {
+      await fs.writeFile(CUSTOM_TOOLS_MANIFEST, JSON.stringify([], null, 2), "utf-8");
+      console.log("Custom tools database initialized.");
+    }
   } catch (err) {
     console.error("Failed to initialize system folders:", err);
   }
@@ -90,6 +101,58 @@ async function get_lessons(): Promise<any[]> {
     return JSON.parse(raw);
   } catch {
     return [];
+  }
+}
+
+async function get_custom_tools(): Promise<any[]> {
+  try {
+    const raw = await fs.readFile(CUSTOM_TOOLS_MANIFEST, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+async function execute_custom_tool(tool: any, args: any): Promise<string> {
+  try {
+    const scriptPath = path.isAbsolute(tool.script) 
+      ? tool.script 
+      : path.resolve(process.cwd(), tool.script);
+      
+    // Verify file exists
+    try {
+      await fs.access(scriptPath);
+    } catch {
+      return `Ошибка: Не найден исполняемый скрипт для инструмента '${tool.name}' по адресу: ${tool.script}`;
+    }
+
+    const argsJsonString = JSON.stringify(args);
+    const escapedArgs = argsJsonString.replace(/'/g, "'\\''");
+
+    let cmd = "";
+    if (scriptPath.endsWith(".py")) {
+      cmd = `python3 "${scriptPath}" '${escapedArgs}'`;
+    } else if (scriptPath.endsWith(".js")) {
+      cmd = `node "${scriptPath}" '${escapedArgs}'`;
+    } else if (scriptPath.endsWith(".sh")) {
+      cmd = `bash "${scriptPath}" '${escapedArgs}'`;
+    } else {
+      cmd = `"${scriptPath}" '${escapedArgs}'`;
+    }
+
+    console.log(`[Custom Tool Factory] Running tool '${tool.name}' via command: ${cmd}`);
+    
+    const { stdout, stderr } = await execAsync(cmd, { timeout: 60000 });
+    
+    let result = stdout || "";
+    if (stderr && stderr.trim()) {
+      result += `\n[Логи/Stderr ошибки]:\n${stderr}`;
+    }
+    
+    return result.trim() === "" ? "[Успешно: Скрипт завершился без вывода]" : result;
+  } catch (err: any) {
+    console.error(`Error executing custom tool ${tool.name}:`, err);
+    return `Ошибка запуска пользовательского инструмента ${tool.name}: ${err.message}${err.stdout ? `\nStdout:\n${err.stdout}` : ""}${err.stderr ? `\nStderr:\n${err.stderr}` : ""}`;
   }
 }
 
@@ -253,10 +316,106 @@ const DEEPSEEK_TOOLS = [
         "required": ["path", "query"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delegate_task_to_model",
+      "description": "ЭКСКЛЮЗИВНЫЙ ИНСТРУМЕНТ: Делегировать подзадачу (например, дизайн-анализ, сложное кодирование, исследование или написание текстов) специализированной модели ИИ через шлюз RouterAI под капотом. Рекомендуемые модели: 'anthropic/claude-3-5-sonnet' (для сложного кода/рефакторинга), 'openai/gpt-4o' (для креатива, дизайна и структуры), 'google/gemini-2.5-pro' (для глубоких исследований больших файлов/данных), 'deepseek/deepseek-r1' (для сложной математики и логического рассуждения), 'google/gemini-2.5-flash' (для простых рутинных задач, быстрого суммирования). Возвращает ответ выбранной модели.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Идентификатор модели в RouterAI (например, 'anthropic/claude-3-5-sonnet', 'openai/gpt-4o', 'google/gemini-2.5-pro', 'deepseek/deepseek-r1', 'google/gemini-2.5-flash', 'openai/gpt-4o-mini', 'deepseek/deepseek-chat')"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Текст задания (все исходные данные, контекст, ссылки, ТЗ и инструкции)"
+          },
+          "system_instruction": {
+            "type": "string",
+            "description": "Необязательная системная инсталляция для делегируемой модели (ее роль, ограничения вывода)"
+          }
+        },
+        "required": ["model", "prompt"]
+      }
+    }
   }
 ];
 
 // Tool Implementation Logic
+async function delegate_task_to_model_tool(model: string, prompt: string, system_instruction?: string, routerKey?: string): Promise<string> {
+  const finalRouterKey = routerKey || process.env.ROUTER_API_KEY || "";
+  const hasRouter = finalRouterKey && finalRouterKey.trim() !== "" && !finalRouterKey.includes("MY_ROUTER_API_KEY");
+
+  if (!hasRouter) {
+    // Attempt fallback to Gemini API if direct key is available
+    const geminiKey = process.env.GEMINI_API_KEY || "";
+    if (geminiKey && geminiKey.trim() !== "" && !geminiKey.includes("MY_GEMINI_API_KEY")) {
+      try {
+        console.log(`[Delegation Fallback] No RouterAI API key. Delegating task to direct Gemini model...`);
+        const client = getGeminiClient(geminiKey);
+        const systemText = system_instruction || "";
+        const response = await client.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: prompt,
+          config: {
+            systemInstruction: systemText,
+            temperature: 0.6,
+          }
+        });
+        return `[ПРИМЕЧАНИЕ: Выполнен автоматический фоллбэк на прямую Gemini 3.5 Flash из-за ненастроенного ROUTER_API_KEY]\n\n[ОТВЕТ МОДЕЛИ]:\n${response.text || ""}`;
+      } catch (geminiErr: any) {
+        return `Ошибка фоллбэка на Gemini: ${geminiErr.message}`;
+      }
+    }
+    return "Ошибка: Для использования делегирования моделей настройте ROUTER_API_KEY или GEMINI_API_KEY в Secrets.";
+  }
+
+  try {
+    console.log(`[Delegation Tool] Sending task to model "${model}"... Prompt length: ${prompt.length}`);
+    const messages: any[] = [];
+    if (system_instruction) {
+      messages.push({ role: "system", content: system_instruction });
+    }
+    messages.push({ role: "user", content: prompt });
+
+    const response = await fetch("https://routerai.ru/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${finalRouterKey}`
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: model.includes("r1") || model.includes("reasoning") ? 1.0 : 0.6,
+      })
+    });
+
+    if (!response.ok) {
+      const rawErr = await response.text();
+      return `Ошибка делегирования модели ${model} (RouterAI статус ${response.status}): ${rawErr}`;
+    }
+
+    const data: any = await response.json();
+    const resultText = data?.choices?.[0]?.message?.content || "";
+    const reasoningText = data?.choices?.[0]?.message?.reasoning_content || "";
+
+    let finalOutput = "";
+    if (reasoningText) {
+      finalOutput += `[МЫШЛЕНИЕ МОДЕЛИ]:\n${reasoningText}\n\n`;
+    }
+    finalOutput += `[ОТВЕТ МОДЕЛИ]:\n${resultText}`;
+
+    console.log(`[Delegation Tool] Received response from "${model}". Response length: ${finalOutput.length}`);
+    return finalOutput;
+  } catch (err: any) {
+    return `Исключение при обращении к модели ${model}: ${err.message}`;
+  }
+}
+
 async function document_rag_search_tool(filePath: string, query: string): Promise<string> {
   try {
     const target = path.isAbsolute(filePath) ? filePath : path.resolve(process.cwd(), filePath);
@@ -541,7 +700,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
                   "Authorization": `Bearer ${routerKey}`
                 },
                 body: JSON.stringify({
-                  model: "google/gemini-2.0-flash",
+                  model: "google/gemini-2.5-flash",
                   messages: [{ role: "user", content: summarizationPrompt }],
                   temperature: 0.3
                 })
@@ -654,30 +813,38 @@ app.post("/api/chat", async (req, res): Promise<any> => {
 
     let routingSystemInstructionOverride = "";
 
-    if (hasRouter && modelSelection === "auto") {
+    if (hasRouter) {
       provider = "RouterAI";
       
-      if (containsComplexTask) {
-        // High complexity -> route to flagships: DeepSeek Reasoning or GPT-4o
-        activeModel = userRequestedModelPrefix === "openai" ? "openai/gpt-4o" : "deepseek/deepseek-reasoning";
-        
-        if (userRequestedModelPrefix === "deepseek" && !lowerMsg.includes("reasoning") && !lowerMsg.includes("рассужд")) {
-          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Пользователь просил использовать стандартный дешевый DeepSeek, но задача крайне сложная (${complexityReason}). Поэтому роутер под капотом перенаправил запрос на мощную модель "deepseek/deepseek-reasoning" с глубоким мышлением. Обязательно в НАЧАЛЕ своего ответа прокомментируй это дружелюбно и непринужденно в стиле: "Чувак, нифига, задача сложная (связана с кодом/инфраструктурой), поэтому я задействовал глубокое рассуждение DeepSeek Reasoning, а не простой чат!". Пожалуйста, скажи это ровно в таком дружеском тоне.`;
-        } else if (userRequestedModelPrefix && userRequestedModelPrefix !== "deepseek") {
-          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Пользователь выбрал ${userRequestedModelLabel}, но задача сложная (${complexityReason}). Сервер автоматически перенаправил запрос на модель ${activeModel} для высочайшего качества. Прокомментируй это дружелюбно в начале ответа: "Чувак, задача довольно сложная, поэтому чтобы всё прошло идеально, я подключил мощную модель ${activeModel === "openai/gpt-4o" ? "GPT-4o" : "DeepSeek Reasoning"}!".`;
+      if (modelSelection === "auto") {
+        if (containsComplexTask) {
+          // High complexity -> route to flagships: DeepSeek R1 or GPT-4o
+          activeModel = userRequestedModelPrefix === "openai" ? "openai/gpt-4o" : "deepseek/deepseek-r1";
+          
+          if (userRequestedModelPrefix === "deepseek" && !lowerMsg.includes("reasoning") && !lowerMsg.includes("рассужд")) {
+            routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Пользователь просил использовать стандартный дешевый DeepSeek, но задача крайне сложная (${complexityReason}). Поэтому роутер под капотом перенаправил запрос на мощную модель "deepseek/deepseek-r1" с глубоким мышлением. Обязательно в НАЧАЛЕ своего ответа прокомментируй это дружелюбно и непринужденно в стиле: "Чувак, нифига, задача сложная (связана с кодом/инфраструктурой), поэтому я задействовал глубокое рассуждение DeepSeek R1, а не простой чат!". Пожалуйста, скажи это ровно в таком дружеском тоне.`;
+          } else if (userRequestedModelPrefix && userRequestedModelPrefix !== "deepseek") {
+            routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Пользователь выбрал ${userRequestedModelLabel}, но задача сложная (${complexityReason}). Сервер автоматически перенаправил запрос на модель ${activeModel} для высочайшего качества. Прокомментируй это дружелюбно в начале ответа: "Чувак, задача довольно сложная, поэтому чтобы всё прошло идеально, я подключил мощную модель ${activeModel === "openai/gpt-4o" ? "GPT-4o" : "DeepSeek R1"}!".`;
+          } else {
+            routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Задача классифицирована как высокосложная (${complexityReason}). Сервер под капотом выбрал флагманскую модель "${activeModel}" для лучшего результата. Кратко обоснуй это решение пользователю в начале ответа в живом дружеском ключе.`;
+          }
         } else {
-          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Задача классифицирована как высокосложная (${complexityReason}). Сервер под капотом выбрал флагманскую модель "${activeModel}" для лучшего результата. Кратко обоснуй это решение пользователю в начале ответа в живом дружеском ключе.`;
+          // Low complexity -> fast, lighter model
+          activeModel = userRequestedModelPrefix === "openai" ? "openai/gpt-4o-mini" : 
+                        (userRequestedModelPrefix === "deepseek" ? "deepseek/deepseek-chat" : "google/gemini-2.5-flash");
+                         
+          if (userRequestedModelPrefix) {
+            routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Подтверждена простая задача. Сервер послушно задействовал выбранный тобой "${activeModel}". Сделай забавное замечание в начале ответа, например: "Класс, задача простая, поэтому с удовольствием юзаю ${userRequestedModelLabel}!"`;
+          } else {
+            routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Обычный легкий запрос. Сервер автоматически задействовал быструю модель "${activeModel}".`;
+          }
         }
+      } else if (modelSelection === "gemini-3.5-flash") {
+        activeModel = "google/gemini-3.5-flash";
+      } else if (modelSelection === "deepseek-reasoning") {
+        activeModel = "deepseek/deepseek-r1";
       } else {
-        // Low complexity -> fast, lighter model
-        activeModel = userRequestedModelPrefix === "openai" ? "openai/gpt-4o-mini" : 
-                      (userRequestedModelPrefix === "deepseek" ? "deepseek/deepseek-chat" : "google/gemini-2.0-flash");
-                     
-        if (userRequestedModelPrefix) {
-          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Подтверждена простая задача. Сервер послушно задействовал выбранный тобой "${activeModel}". Сделай забавное замечание в начале ответа, например: "Класс, задача простая, поэтому с удовольствием юзаю ${userRequestedModelLabel}!"`;
-        } else {
-          routingSystemInstructionOverride = `\n[ВНИМАНИЕ МАРШРУТИЗАЦИИ]: Обычный легкий запрос. Сервер автоматически задействовал быструю модель "${activeModel}".`;
-        }
+        activeModel = "deepseek/deepseek-chat";
       }
     } else {
       // Direct traditional provider configurations
@@ -736,9 +903,27 @@ app.post("/api/chat", async (req, res): Promise<any> => {
         ? `\n\nНиже представлены факты и уроки, которые ты сам успешно изучил и записал во внутреннюю память самообучения на этом сервере VPS:\n${lessons.map((l, idx) => `[Урок #${idx+1}] Тема: ${l.category} - ${l.title}\nДетали: ${l.details}`).join("\n\n")}`
         : "";
 
+      const coreInstruction = `Ты — Ин-Кон (In-Con), корпоративный супер-мозг, высокотехнологичный Суперагент и полноценный ассистент-партнер владельца бизнеса, ориентированный на бизнес-девелопмент, стратегический рост и максимальную автоматизацию. Ты не просто чат, а интеллектуальный операционный слой компании, обладающий полным пониманием бизнес-процессов, инфраструктуры и целей.
+
+Твои ключевые качества:
+1. Инициативность и Проактивность: Ты стремишься приносить измеримую пользу бизнесу. Не жди пассивных указаний — предлагай решения, автоматизируй рутину, выявляй слабые места в процессах и коде, создавай инструменты для масштабирования.
+2. Фокус на Результат: Каждый твой ответ, скрипт или действие должны работать безукоризненно и приближать владельца компании к его бизнес-целям.
+3. Полная информированность и Системность: Ты умеешь анализировать огромные массивы информации о бизнесе и претворять их в рабочие алгоритмы.
+
+Инфраструктура Самообучения и Рекурсивность (Твоя главная суперсила):
+- Память и Извлечение уроков: Если ты изучил новые факты об инфраструктуре, сервере VPS или предпочтениях пользователя, обязательно извлеки этот урок и сохрани его во внутреннюю базу знаний через инструмент 'memorize_lesson'.
+- Динамическая Фабрика Инструментов ('Самообогащение'): Если тебе не хватает встроенных инструментов (чтение/запись файлов, shell-команды, поиск, RAG-поиск) для решения сложной бизнес-задачи, ты можешь ДИНАМИЧЕСКИ создавать новые способности!
+  * Как это работает под капотом: 
+    1. Напиши исполняемый скрипт (Python-код, Node.js или Bash) с помощью инструмента 'write_file'. Скрипты сохраняй в каталог 'data/custom_tools/'.
+    2. Зарегистрируй свой новый инструмент в файле манифеста 'data/custom_tools/manifest.json'. Добавь в манифест JSON-описание инструмента: его 'name', 'description', относительный путь к исполняемому 'script' и схему параметров 'parameters' (в формате JSON Schema).
+    3. При следующем вызове или продолжении сессии этот инструмент мгновенно появится в твоем списке доступных функций. При его вызове сервер автоматически выполнит твой скрипт, передав аргументы в виде JSON.
+- Делегирование и Оркестрация: Тебе доступен мощнейший инструмент 'delegate_task_to_model'. Декомпозируй комплексные задачи владельца бизнеса на подзадачи и делегируй их специализированным ИИ (дизайн/копирайтинг поручай 'openai/gpt-4o', сложный код — 'anthropic/claude-3-5-sonnet', глубокие рассуждения — 'deepseek/deepseek-r1'). Затем интегрируй их результаты в целостный стратегический ответ.
+
+Общайся с владельцем бизнеса на уверенном, профессиональном русском языке. Действуй смело, пиши надежный код и используй все свои вычислительные и алгоритмические ресурсы для достижения целей компании.`;
+
       systemText = isReasoning 
-        ? "Ты — высокоточный искусственный интеллект Ин-Кон. Отвечай детально, логично и веди глубокие рассуждения."
-        : `Ты — высокотехнологичный Суперагент Ин-Кон. У тебя есть встроенные инструменты автоматизации VPS сервера (чтение и запись файлов, выполнение shell-команд, веб-поиск, импорт сайтов и запись уроков). Используй их активно при первой необходимости для решения задач пользователя. Отвечай на русском языке. Если ты изучил новые факты об инфраструктуре, сервере VPS или предпочтениях пользователя, выменяй и сохрани этот урок через 'memorize_lesson'.${lessonsBlock}`;
+        ? `${coreInstruction}\n\nПоскольку сейчас активна модель с глубоким мышлением (Reasoning), отвечай максимально развернуто, структурируй свои цепочки рассуждений (thinking) и проводи глубокий стратегический анализ.`
+        : `${coreInstruction}\n\nУ тебя есть встроенный набор инструментов автоматизации VPS: чтение/запись файлов, shell-вызовы, поиск, RAG-поиск и динамическое создание кастомных инструментов. Используй их проактивно при первой же необходимости для решения бизнес-задач пользователя.${lessonsBlock}`;
 
       if (routingSystemInstructionOverride) {
         systemText += routingSystemInstructionOverride;
@@ -772,6 +957,18 @@ app.post("/api/chat", async (req, res): Promise<any> => {
       let hasToolCalls = false;
       let toolCallsToExecute: any[] = [];
 
+      // Load dynamic custom tools
+      const customTools = await get_custom_tools();
+      const formattedCustomTools = customTools.map((t: any) => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters
+        }
+      }));
+      const activeToolsList = [...DEEPSEEK_TOOLS, ...formattedCustomTools];
+
       if (provider === "RouterAI") {
         let response;
         try {
@@ -796,7 +993,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
 
           // Enable tool-calling loop for normal chat models inside RouterAI
           if (!activeModel.includes("reasoning")) {
-            bodyPayload.tools = DEEPSEEK_TOOLS;
+            bodyPayload.tools = activeToolsList;
             bodyPayload.tool_choice = "auto";
           }
 
@@ -816,14 +1013,21 @@ app.post("/api/chat", async (req, res): Promise<any> => {
           }
         } catch (fetchErr: any) {
           console.error("RouterAI fetch error wrapper:", fetchErr);
-          if (hasGemini) {
-            console.warn("RouterAI failed to complete request. Falling back to Gemini...");
+          
+          // Only fallback if the user has a custom Gemini API key configured in the browser
+          const customGeminiKey = req.body.geminiApiKey || req.headers["x-gemini-key"];
+          const hasCustomGemini = customGeminiKey && customGeminiKey.trim() !== "" && !customGeminiKey.includes("MY_GEMINI_API_KEY");
+          
+          if (hasCustomGemini) {
+            console.warn("RouterAI failed to complete request. Falling back to CUSTOM Gemini Key...");
             provider = "Gemini";
             activeModel = "gemini-3.5-flash";
             iteration--;
             continue;
           }
-          throw fetchErr;
+          
+          // Otherwise, bubble up the exact RouterAI API error to the user UI so they can see and debug it 
+          throw new Error(`Сбой RouterAI (${fetchErr.message || fetchErr}). Резервный переход на общую модель Gemini заблокирован во избежание превышения лимитов. Пожалуйста, убедитесь в наличии баланса на аккаунте RouterAI и в корректности введённого API-ключа.`);
         }
 
         const data: any = await response.json();
@@ -867,7 +1071,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
           };
 
           if (activeModel !== "deepseek-reasoning") {
-            bodyPayload.tools = DEEPSEEK_TOOLS;
+            bodyPayload.tools = activeToolsList;
             bodyPayload.tool_choice = "auto";
           }
 
@@ -931,7 +1135,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
         // Setup gemini compatible tools
         const geminiTools = [
           {
-            functionDeclarations: DEEPSEEK_TOOLS.map(t => ({
+            functionDeclarations: activeToolsList.map(t => ({
               name: t.function.name,
               description: t.function.description,
               parameters: {
@@ -1083,12 +1287,20 @@ app.post("/api/chat", async (req, res): Promise<any> => {
             output = await scrape_url_tool(args.url);
           } else if (toolName === "document_rag_search") {
             output = await document_rag_search_tool(args.path, args.query);
+          } else if (toolName === "delegate_task_to_model") {
+            output = await delegate_task_to_model_tool(args.model, args.prompt, args.system_instruction, routerKey);
           } else if (toolName === "memorize_lesson") {
             const newItem = await add_lesson_record(args.category, args.title, args.details);
             output = `Новый урок "${newItem.title}" успешно сохранен в базу знаний самообучения VPS. Номер записи: ${newItem.id}`;
           } else {
-            output = `Инструмент ${toolName} не поддерживается.`;
-            status = "error";
+            const customToolsList = await get_custom_tools();
+            const matchedCustom = customToolsList.find((ct: any) => ct.name === toolName);
+            if (matchedCustom) {
+              output = await execute_custom_tool(matchedCustom, args);
+            } else {
+              output = `Инструмент ${toolName} не поддерживается.`;
+              status = "error";
+            }
           }
         } catch (execErr: any) {
           output = `Ошибка исполнения инструмента: ${execErr.message}`;
