@@ -312,11 +312,13 @@ export default function App() {
     setErrorMsg(null);
 
     try {
-      // Map frontend logs to simple context parameter including files
+      // Map frontend logs to simple context parameter including files and tool execution history
       const contextLogs = newMessages.map((m) => ({
+        id: m.id,
         role: m.role,
         content: m.content,
         files: m.files,
+        toolCalls: m.toolCalls,
       }));
 
       const res = await fetch("/api/chat", {

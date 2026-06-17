@@ -51,12 +51,84 @@ const LESSONS_FILE = path.join(process.cwd(), "data", "lessons.json");
 const CUSTOM_TOOLS_DIR = path.join(process.cwd(), "data", "custom_tools");
 const CUSTOM_TOOLS_MANIFEST = path.join(CUSTOM_TOOLS_DIR, "manifest.json");
 
+/**
+ * Translates Docker container mount paths to align with host directories
+ */
+function translatePath(filePath: string): string {
+  if (!filePath) return filePath;
+  let p = filePath.replace(/\\/g, "/");
+
+  // Map host /root/agent/data/ or ./root/agent/data/ to container /data/
+  p = p.replace(/^\/?root\/agent\/data\//i, "/data/");
+  p = p.replace(/^\.\/root\/agent\/data\//i, "/data/");
+
+  // Map host /root/workinfo/ or ./root/workinfo/ to container /workinfo/
+  p = p.replace(/^\/?root\/workinfo\//i, "/workinfo/");
+  p = p.replace(/^\.\/root\/workinfo\//i, "/workinfo/");
+
+  const isSystemData = p.includes("data/custom_tools/") || 
+                        p.includes("data/lessons.json") || 
+                        p.includes("data/conversations/");
+
+  if (!isSystemData) {
+    if (p.startsWith("data/")) {
+      p = "/data/" + p.slice(5);
+    } else if (p.startsWith("./data/")) {
+      p = "/data/" + p.slice(7);
+    }
+    
+    if (p.startsWith("workinfo/")) {
+      p = "/workinfo/" + p.slice(9);
+    } else if (p.startsWith("./workinfo/")) {
+      p = "/workinfo/" + p.slice(11);
+    }
+  }
+
+  const resolved = path.isAbsolute(p) ? p : path.resolve(process.cwd(), p);
+  return resolved;
+}
+
 const initDirectories = async () => {
   try {
     await fs.mkdir(CONVERSATIONS_DIR, { recursive: true });
     await fs.mkdir(CUSTOM_TOOLS_DIR, { recursive: true });
     console.log(`Directories normalized: ${CONVERSATIONS_DIR} and ${CUSTOM_TOOLS_DIR}`);
-    
+
+    // Create symbolic links inside /app/data to redirect /data mounts
+    const ensureSymlink = async (targetPath: string, linkPath: string) => {
+      try {
+        await fs.mkdir(targetPath, { recursive: true });
+        
+        let exists = false;
+        let isSymlink = false;
+        try {
+          const stats = await fs.lstat(linkPath);
+          exists = true;
+          isSymlink = stats.isSymbolicLink();
+        } catch {}
+
+        if (exists) {
+          if (isSymlink) {
+            console.log(`[Symlink Engine] Already configured: ${linkPath} -> ${targetPath}`);
+            return;
+          }
+          console.warn(`[Symlink Engine] Real directory exists at link target, backing up and replacing: ${linkPath}`);
+          await fs.rm(linkPath, { recursive: true, force: true });
+        }
+
+        await fs.symlink(targetPath, linkPath, "dir");
+        console.log(`[Symlink Engine] Created symlink: ${linkPath} -> ${targetPath}`);
+      } catch (smErr: any) {
+        console.warn(`[Symlink Engine] Failed linking ${linkPath} -> ${targetPath}:`, smErr.message);
+      }
+    };
+
+    // Ensure link redirection
+    await ensureSymlink("/data/user_uploads", path.join(process.cwd(), "data", "user_uploads"));
+    await ensureSymlink("/data/input", path.join(process.cwd(), "data", "input"));
+    await ensureSymlink("/data/output", path.join(process.cwd(), "data", "output"));
+    await ensureSymlink("/workinfo", path.join(process.cwd(), "workinfo"));
+
     // Seed default lessons if missing
     try {
       await fs.access(LESSONS_FILE);
@@ -418,7 +490,7 @@ async function delegate_task_to_model_tool(model: string, prompt: string, system
 
 async function document_rag_search_tool(filePath: string, query: string): Promise<string> {
   try {
-    const target = path.isAbsolute(filePath) ? filePath : path.resolve(process.cwd(), filePath);
+    const target = translatePath(filePath);
     const text = await fs.readFile(target, "utf-8");
     
     if (!text || text.trim() === "") {
@@ -526,7 +598,7 @@ async function document_rag_search_tool(filePath: string, query: string): Promis
 
 async function read_file_tool(filePath: string): Promise<string> {
   try {
-    const target = path.isAbsolute(filePath) ? filePath : path.resolve(process.cwd(), filePath);
+    const target = translatePath(filePath);
     const text = await fs.readFile(target, "utf-8");
     return `--- СОДЕРЖИМОЕ ФАЙЛА ${filePath} ---\n${text}`;
   } catch (err: any) {
@@ -536,7 +608,7 @@ async function read_file_tool(filePath: string): Promise<string> {
 
 async function write_file_tool(filePath: string, content: string): Promise<string> {
   try {
-    const target = path.isAbsolute(filePath) ? filePath : path.resolve(process.cwd(), filePath);
+    const target = translatePath(filePath);
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, content, "utf-8");
     return `Файл "${filePath}" успешно создан/записан.`;
@@ -635,6 +707,98 @@ async function scrape_url_tool(targetUrl: string): Promise<string> {
   } catch (err: any) {
     return `Ошибка парсинга страницы: ${err.message}`;
   }
+}
+
+/**
+ * Helper function to format chat history for OpenAI-compatibility with vision capabilities
+ */
+function formatOpenAIMessages(loopMessages: any[], activeModel: string): any[] {
+  const modelLower = activeModel.toLowerCase();
+  
+  // High-performance models on RouterAI or OpenAI/Anthropic/Gemini that support standard OpenAI multimodal schema
+  const supportsVision = modelLower.includes("gpt") || 
+                         modelLower.includes("claude") || 
+                         modelLower.includes("gemini") || 
+                         modelLower.includes("vision") || 
+                         modelLower.includes("lba") || 
+                         modelLower.includes("pixtral");
+
+  return loopMessages.map((m: any) => {
+    let textContent = m.content || "";
+    const files = m.files || [];
+    
+    if (files.length === 0) {
+      if (m.tool_calls) {
+        return {
+          role: m.role,
+          content: textContent || null,
+          tool_calls: m.tool_calls,
+          name: m.name,
+          tool_call_id: m.tool_call_id,
+        };
+      }
+      return {
+        role: m.role,
+        content: textContent,
+        name: m.name,
+        tool_call_id: m.tool_call_id,
+      };
+    }
+
+    const imageFiles = files.filter((f: any) => f.type && f.type.startsWith("image/"));
+    const nonImageFiles = files.filter((f: any) => !f.type || !f.type.startsWith("image/"));
+
+    // Compile text prefix with non-image files listed as info
+    let customText = textContent;
+    if (nonImageFiles.length > 0) {
+      const fileNames = nonImageFiles.map((f: any) => `[Вложенный файл: ${f.name} (тип: ${f.type || "unknown"})]`).join("\n");
+      customText = customText ? `${customText}\n\n${fileNames}` : fileNames;
+    }
+
+    // Format with image_url blocks if vision is supported and there are image attachments
+    if (supportsVision && imageFiles.length > 0) {
+      const contentArray: any[] = [];
+      if (customText) {
+        contentArray.push({ type: "text", text: customText });
+      }
+      for (const img of imageFiles) {
+        contentArray.push({
+          type: "image_url",
+          image_url: {
+            url: img.base64 // standard inline base64 string "data:image/jpeg;base64,..."
+          }
+        });
+      }
+      return {
+        role: m.role,
+        content: contentArray,
+        tool_calls: m.tool_calls,
+        name: m.name,
+        tool_call_id: m.tool_call_id,
+      };
+    } else if (imageFiles.length > 0) {
+      // Model doesn't support vision directly, so let's append image filenames
+      const imageNames = imageFiles.map((f: any) => `[Вложенная картинка: ${f.name} (тип: ${f.type || "unknown"}) - изображение было опущено на сервере, так как выбранная модель не поддерживает Vision]`).join("\n");
+      customText = customText ? `${customText}\n\n${imageNames}` : imageNames;
+    }
+
+    if (m.tool_calls) {
+      return {
+        role: m.role,
+        content: customText || null,
+        tool_calls: m.tool_calls,
+        name: m.name,
+        tool_call_id: m.tool_call_id,
+      };
+    }
+
+    return {
+      role: m.role,
+      content: customText,
+      name: m.name,
+      tool_call_id: m.tool_call_id,
+    };
+  });
 }
 
 /**
@@ -885,14 +1049,47 @@ app.post("/api/chat", async (req, res): Promise<any> => {
 
     console.log(`[Cognitive Routing] Provider: ${provider}, Model: ${activeModel}, Reasoning: ${isReasoning}`);
 
-    let loopMessages = activeMessages.map((m: any) => ({
-      role: m.role,
-      content: m.content,
-      tool_calls: m.tool_calls,
-      name: m.name,
-      tool_call_id: m.tool_call_id,
-      files: m.files,
-    })) as any[];
+    let loopMessages: any[] = [];
+    for (const m of activeMessages) {
+      if (m.role === "assistant" && m.toolCalls && Array.isArray(m.toolCalls) && m.toolCalls.length > 0) {
+        // Reconstruct assistant message standard API tool_calls list
+        const toolCallsList = m.toolCalls.map((tc: any, index: number) => ({
+          id: `call-${m.id || Date.now()}-${index}`,
+          type: "function",
+          function: {
+            name: tc.toolName,
+            arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments)
+          }
+        }));
+
+        loopMessages.push({
+          role: "assistant",
+          content: m.content || null,
+          tool_calls: toolCallsList,
+          files: m.files,
+        });
+
+        // Add corresponding tool responses in correct sequential order
+        for (let i = 0; i < m.toolCalls.length; i++) {
+          const tc = m.toolCalls[i];
+          loopMessages.push({
+            role: "tool",
+            tool_call_id: `call-${m.id || Date.now()}-${i}`,
+            name: tc.toolName,
+            content: tc.output || ""
+          });
+        }
+      } else {
+        loopMessages.push({
+          role: m.role,
+          content: m.content,
+          tool_calls: m.tool_calls,
+          name: m.name,
+          tool_call_id: m.tool_call_id,
+          files: m.files,
+        });
+      }
+    }
 
     // Inject Superagent core prompt
     const hasSystemInstruction = loopMessages.some(m => m.role === "system");
@@ -903,7 +1100,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
         ? `\n\nНиже представлены факты и уроки, которые ты сам успешно изучил и записал во внутреннюю память самообучения на этом сервере VPS:\n${lessons.map((l, idx) => `[Урок #${idx+1}] Тема: ${l.category} - ${l.title}\nДетали: ${l.details}`).join("\n\n")}`
         : "";
 
-      const coreInstruction = `Ты — Ин-Кон (In-Con), корпоративный супер-мозг, высокотехнологичный Суперагент и полноценный ассистент-партнер владельца бизнеса, ориентированный на бизнес-девелопмент, стратегический рост и максимальную автоматизацию. Ты не просто чат, а интеллектуальный операционный слой компании, обладающий полным пониманием бизнес-процессов, инфраструктуры и целей.
+      let coreInstruction = `Ты — Ин-Кон (In-Con), корпоративный супер-мозг, высокотехнологичный Суперагент и полноценный ассистент-партнер владельца бизнеса, ориентированный на бизнес-девелопмент, стратегический рост и максимальную автоматизацию. Ты не просто чат, а интеллектуальный операционный слой компании, обладающий полным пониманием бизнес-процессов, инфраструктуры и целей.
 
 Твои ключевые качества:
 1. Инициативность и Проактивность: Ты стремишься приносить измеримую пользу бизнесу. Не жди пассивных указаний — предлагай решения, автоматизируй рутину, выявляй слабые места в процессах и коде, создавай инструменты для масштабирования.
@@ -920,6 +1117,26 @@ app.post("/api/chat", async (req, res): Promise<any> => {
 - Делегирование и Оркестрация: Тебе доступен мощнейший инструмент 'delegate_task_to_model'. Декомпозируй комплексные задачи владельца бизнеса на подзадачи и делегируй их специализированным ИИ (дизайн/копирайтинг поручай 'openai/gpt-4o', сложный код — 'anthropic/claude-3-5-sonnet', глубокие рассуждения — 'deepseek/deepseek-r1'). Затем интегрируй их результаты в целостный стратегический ответ.
 
 Общайся с владельцем бизнеса на уверенном, профессиональном русском языке. Действуй смело, пиши надежный код и используй все свои вычислительные и алгоритмические ресурсы для достижения целей компании.`;
+
+      // Try dynamically loading instructions from agent.md in ./data/agent.md or ./agent.md
+      try {
+        let loadedInstructions = "";
+        try {
+          loadedInstructions = await fs.readFile(path.join(process.cwd(), "data", "agent.md"), "utf-8");
+        } catch {
+          try {
+            loadedInstructions = await fs.readFile(path.join(process.cwd(), "agent.md"), "utf-8");
+          } catch {
+            // Ignored, fallback to coreInstruction
+          }
+        }
+        if (loadedInstructions && loadedInstructions.trim().length > 0) {
+          console.log(`[Superagent] Successfully loaded dynamic system instructions from agent.md file (${loadedInstructions.length} chars).`);
+          coreInstruction = loadedInstructions.trim();
+        }
+      } catch (dynamicErr) {
+        console.warn("[Superagent] Failed to load agent.md dynamically, using defaults:", dynamicErr);
+      }
 
       systemText = isReasoning 
         ? `${coreInstruction}\n\nПоскольку сейчас активна модель с глубоким мышлением (Reasoning), отвечай максимально развернуто, структурируй свои цепочки рассуждений (thinking) и проводи глубокий стратегический анализ.`
@@ -974,20 +1191,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
         try {
           const bodyPayload: any = {
             model: activeModel,
-            messages: loopMessages.map((m: any) => {
-              let textContent = m.content || "";
-              if (m.files && Array.isArray(m.files) && m.files.length > 0) {
-                const fileNames = m.files.map((f: any) => `[Вложенный файл: ${f.name} (тип: ${f.type})]`).join("\n");
-                textContent = `${textContent}\n\n${fileNames}`;
-              }
-              return {
-                role: m.role,
-                content: textContent,
-                tool_calls: m.tool_calls,
-                name: m.name,
-                tool_call_id: m.tool_call_id,
-              };
-            }),
+            messages: formatOpenAIMessages(loopMessages, activeModel),
             temperature: activeModel.includes("reasoning") ? 1.0 : 0.6,
           };
 
@@ -1053,20 +1257,7 @@ app.post("/api/chat", async (req, res): Promise<any> => {
         try {
           const bodyPayload: any = {
             model: activeModel,
-            messages: loopMessages.map((m: any) => {
-              let textContent = m.content || "";
-              if (m.files && Array.isArray(m.files) && m.files.length > 0) {
-                const fileNames = m.files.map((f: any) => `[Вложенный файл: ${f.name} (тип: ${f.type})]`).join("\n");
-                textContent = `${textContent}\n\n${fileNames}`;
-              }
-              return {
-                role: m.role,
-                content: textContent,
-                tool_calls: m.tool_calls,
-                name: m.name,
-                tool_call_id: m.tool_call_id,
-              };
-            }),
+            messages: formatOpenAIMessages(loopMessages, activeModel),
             temperature: activeModel === "deepseek-reasoning" ? 1.0 : 0.6,
           };
 
